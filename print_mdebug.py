@@ -145,16 +145,30 @@ def read_auxiliary_symbol(file_data, offset):
         word0, word0, word0, word0, word0, word0))
     return read_auxiliary_symbol.cache[offset]
 
+import queue
+
+read_string_offsets = set()
+unread_string_offsets = queue.PriorityQueue()
+
 def read_string(file_data, offset):
+    read_string_offsets.add(offset)
     current_offset = 0
     current_string = b''
     while True:
         char = struct.unpack('c', file_data[offset+current_offset:offset+current_offset+1])[0]
         if char == b'\0':
-            return current_string.decode('ascii')
+            try:
+                ret = current_string.decode('ascii')
+            except UnicodeDecodeError:
+                return None
+            break
         else:
             current_string += char
         current_offset += 1
+    while struct.unpack('c', file_data[offset+current_offset:offset+current_offset+1])[0] == b'\0':
+        current_offset += 1
+    unread_string_offsets.put(offset+current_offset)
+    return ret
 
 def map_relative_file_descriptor(file_data, fd, symbolic_header, rfd_num):
     if fd.crfd == 0:
@@ -584,6 +598,12 @@ def main():
 
             print('    pretty print:')
             print_symbols(file_data, fd, symbolic_header)
+
+    print("--- SKIPPED STRINGS: ---")
+    while not unread_string_offsets.empty():
+        offset = unread_string_offsets.get()
+        if offset not in read_string_offsets:
+            sys.stderr.write(hex(offset)+' '+read_string(file_data, offset)+'\n')
 
 
 main()
