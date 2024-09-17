@@ -127,6 +127,9 @@ def read_symbol(file_data, offset):
         word0, word1, (word2 >> 26) & 0x3F, (word2 >> 21) & 0x1F, word2 & 0xFFFFF))
     return read_symbol.cache[offset]
 
+def read_ext_symbol(file_data, offset):
+    return struct.unpack('>IIII', file_data[offset:offset+16])
+
 def read_auxiliary_symbol(file_data, offset):
     if 'init' not in read_auxiliary_symbol.__dict__:
         read_auxiliary_symbol.cache = {}
@@ -401,89 +404,19 @@ def print_procedure(file_data, fd, symbolic_header, proc_sym_num):
 
     return sym_num
 
-def print_symbols(file_data, fd, symbolic_header):
+def print_symbols(file_data, fd, symbolic_header, filename):
     sym_num = fd.isymBase
-    indirects = []
-    typedefs = []
+    lastProc = None
     while sym_num < fd.isymBase + fd.csym:
-        root_sym = read_symbol(file_data, symbolic_header.cbSymOffset - OFFSET + sym_num*12)
-        if root_sym.st == 10: # stTypedef
-            aux = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + (fd.iauxBase + root_sym.index)*4)
-            offset = 0
-            if aux.ti.fBitfield == 1:
-                offset = 1
-            if aux.ti.bt == 12 or aux.ti.bt == 13  or aux.ti.bt == 14 or aux.ti.bt == 15: # btStruct, btUnion, btEnum, btTypedef
-                aux2 = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + (fd.iauxBase + root_sym.index + 1 + offset)*4)
-                fd_num = aux2.rndx.rfd
-                if fd_num == 4095:
-                    fd_num = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + (fd.iauxBase + root_sym.index + 2 + offset)*4).isym
-                fd_num = map_relative_file_descriptor(file_data, fd, symbolic_header, fd_num)
-                fd2 = read_file_descriptor(file_data, symbolic_header.cbFdOffset - OFFSET + fd_num*72)
-                sym2 = read_symbol(file_data, symbolic_header.cbSymOffset - OFFSET + (fd2.isymBase + aux2.rndx.index)*12)
-                name = read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd2.issBase + sym2.iss)
-                if name != '':
-                    typedefs.append(name)
-        elif root_sym.st == 34: # stIndirect
-            name = read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + root_sym.iss)
-            indirects.append(name);
+        sym = read_symbol(file_data, symbolic_header.cbSymOffset - OFFSET + sym_num*12)
+        name = read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + sym.iss)
+        if sym.value < -0x100000:
+            if sym.st == 6:
+                lastProc = name
+            elif sym.st == 2 and lastProc:
+                name = lastProc+":"+name
+            print(hex(sym.value + 0x100000000), filename, name)
         sym_num += 1
-    sym_num = fd.isymBase
-    while sym_num < fd.isymBase + fd.csym:
-        root_sym = read_symbol(file_data, symbolic_header.cbSymOffset - OFFSET + sym_num*12)
-        if root_sym.st == 11: # stFile
-            file_name = read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + root_sym.iss)
-            print('// begin file %s\n' %  file_name)
-            sym_num += 1
-            leaf_sym = read_symbol(file_data, symbolic_header.cbSymOffset - OFFSET + sym_num*12)
-            while leaf_sym.st != 8: # stEnd
-                if leaf_sym.st == 26 or leaf_sym.st == 27: # stStruct, stUnion
-                    name = read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + leaf_sym.iss)
-                    if (name != '') and ((name in indirects) or (name not in typedefs)): # TODO
-                        print('%s;\n' % get_struct_or_union_string(file_data, fd, symbolic_header, sym_num, False))
-                    sym_num = fd.isymBase + leaf_sym.index
-                elif leaf_sym.st == 28: # stEnum
-                    name = read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + leaf_sym.iss)
-                    if (name != '') and (name not in typedefs): # TODO
-                        print('%s;\n' % get_enum_string(file_data, fd, symbolic_header, sym_num))
-                    sym_num = fd.isymBase + leaf_sym.index
-                elif leaf_sym.st == 10: # stTypedef
-                    # TODO typedef for stIndirect shoulf print the keyword i.e. typdef >struct< THING thing
-                    print_typedef_symbols(file_data, fd, symbolic_header, sym_num)
-                    sym_num += 1
-                    print('')
-                elif leaf_sym.st == 6 or leaf_sym.st == 14: # stProc, stStaticProc
-                    # TODO how do stProc and stStaticProc differ? stStaticProc isn't exported?
-                    sym_num = print_procedure(file_data, fd, symbolic_header, sym_num)
-                    print('')
-                elif leaf_sym.st == 2: # stStatic
-                    static_name = read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + leaf_sym.iss)
-                    if leaf_sym.sc == 2 or leaf_sym.sc == 3 or leaf_sym.sc == 5 or leaf_sym.sc == 15: # scData, scBss, scAbsolute, scRData
-                        if leaf_sym.index != 0xFFFFF: # looks like it's an invalid value for .s files
-                            print('static %s;\n' % get_type_string(file_data, fd, symbolic_header, leaf_sym.index, static_name, True))
-                        else:
-                            print('static %s;\n' % static_name)
-                    else:
-                         print('ERROR unknown sc for stStatic in print_symbols: %d' % leaf_sym.sc)
-                    sym_num += 1
-                elif leaf_sym.st == 34: # stIndirect
-                     # stIndirect is put out when the compiler sees a struct when it is not yet defined
-                     # TODO more info
-                    sym_num += 1
-                elif leaf_sym.st == 5: # stLabel
-                    print('// label: %s' % read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + leaf_sym.iss))
-                    sym_num += 1
-                elif leaf_sym.st == 0: # stNil
-                    print('// nil: %s' % read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + leaf_sym.iss))
-                    sym_num += 1
-                else:
-                    print('ERROR unknown st in leaf_sym in print_symbols: %d' % leaf_sym.st)
-                    sym_num += 1
-                leaf_sym = read_symbol(file_data, symbolic_header.cbSymOffset - OFFSET + sym_num*12)
-            sym_num = fd.isymBase + root_sym.index
-            print('// end file %s' %  file_name)
-        else:
-            print('ERROR expected st of stFile as only root type in print_symbols:%d' % root_sym.st)
-            return
 
 def main():
     global OFFSET
@@ -502,88 +435,21 @@ def main():
     elf_header = read_elf_header(file_data, 0)
     section_headers = []
     debug_index = 0xFFFFFFFF
-    #print('%r' % (elf_header,))
     for i in range(elf_header.e_shnum):
         section_headers.append(read_elf_section_header(file_data, elf_header.e_shoff + i*40))
-        #print('%r' % (section_headers[i],))
         if section_headers[i].sh_type == 0x70000005:
             debug_index = i
 
     if debug_index != 0xFFFFFFFF:
         symbolic_header = read_symbolic_header(file_data, section_headers[debug_index].sh_offset)
-        file_descriptors = []
-        print('%r' % (symbolic_header,))
-        # Set offset by assuming that there are no optimization symbols so cbOptOffset points to the start of the symbolic header
-        #OFFSET = symbolic_header.cbOptOffset - section_headers[debug_index].sh_offset
-        #print('Using OFFSET of %d' % OFFSET)
-        #for sym_num in range(symbolic_header.isymMax):
-            #sym = read_symbol(file_data, symbolic_header.cbSymOffset - OFFSET + sym_num*12)
-            #print('%d:%r' % (sym_num, (sym,)));
-        #for aux_num in range(symbolic_header.iauxMax):
-            #aux = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + aux_num*4)
-            #print('%d:%r' % (aux_num, (aux,)));
+        for ext_sym_num in range(symbolic_header.iextMax):
+            a,b,c,d = read_ext_symbol(file_data, symbolic_header.cbExtOffset - OFFSET + ext_sym_num*16)
+            name = read_string(file_data, symbolic_header.cbSsExtOffset - OFFSET + b)
+            if c >= 0x80000000:
+                print(hex(c), 'EXTERNAL', name)
         for file_num in range(symbolic_header.ifdMax):
             fd = read_file_descriptor(file_data, symbolic_header.cbFdOffset - OFFSET + file_num*72)
-            file_descriptors.append(fd)
-        for file_num in range(symbolic_header.ifdMax):
-            fd = read_file_descriptor(file_data, symbolic_header.cbFdOffset - OFFSET + file_num*72)
-            print('%r' % (fd,))
-            print('    name:%s' % read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + fd.rss))
-
-            '''
-            print('    Relative File Descriptors:')
-            for rfd_num in range(fd.rfdBase, fd.rfdBase + fd.crfd):
-                offset = symbolic_header.cbRfdOffset - OFFSET + rfd_num*4
-                rfd_index = struct.unpack('>I', file_data[offset:offset+4])[0]
-                rfd = read_file_descriptor(file_data, symbolic_header.cbFdOffset - OFFSET + rfd_index*72)
-                print('        %d:%r' % (rfd_index, (rfd,)))
-            '''
-
-            '''
-            print('    procedures:')
-            for proc_num in range(fd.ipdFirst, fd.ipdFirst + fd.cpd):
-                pd = read_procedure_descriptor(file_data, symbolic_header.cbPdOffset - OFFSET + proc_num*52)
-                print('        %r' % ((pd,)))
-            '''
-
-            '''
-            print('    symbols:')
-            for sym_num in range(fd.isymBase, fd.isymBase + fd.csym):
-                sym = read_symbol(file_data, symbolic_header.cbSymOffset - OFFSET + sym_num*12)
-                print('        %r' % ((sym,)))
-                print('            name:%s' % read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + sym.iss))
-                print('            type:%s(%d)' % (symbol_type_list[sym.st], sym.st))
-                print('            storage class:%s(%d)' % (storage_class_list[sym.sc], sym.sc))
-                if sym.st == 3 or sym.st == 4 or sym.st == 9 or sym.st == 10 or sym.st == 28: # stParam, stLocal, stMember, stTypedef, stEnum
-                    aux = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + (fd.iauxBase + sym.index)*4)
-                    print('            %r' % ((aux,)))
-                    offset = 0
-                    if aux.ti.fBitfield == 1:
-                        bitfield_aux = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + (fd.iauxBase + sym.index + 1)*4)
-                        print('            %r' % ((bitfield_aux,)))
-                        offset = 1
-                    if aux.ti.bt == 12 or aux.ti.bt == 13  or aux.ti.bt == 14 or aux.ti.bt == 15: # btStruct, btUnion, btEnum, btTypedef
-                        aux2 = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + (fd.iauxBase + sym.index + 1 + offset)*4)
-                        print('            %r' % ((aux2,)))
-                        fd_num = aux2.rndx.rfd
-                        if fd_num == 4095:
-                            aux3 = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + (fd.iauxBase + sym.index + 2 + offset)*4)
-                            print('            %r' % ((aux3,)))
-                            fd_num = aux3.isym
-                        fd_num = map_relative_file_descriptor(file_data, fd, symbolic_header, fd_num)
-                        sym2 = read_symbol(file_data, symbolic_header.cbSymOffset - OFFSET + (file_descriptors[fd_num].isymBase + aux2.rndx.index)*12)
-                        print('                %r' % (sym2,))
-                        print('                    name:%s' % read_string(file_data, symbolic_header.cbSsOffset - OFFSET + file_descriptors[aux3.isym].issBase + sym2.iss))
-                if sym.st == 6 or sym.st == 14: # stProc, stStaticProc
-                    # TODO what is the first aux symbol for?
-                    aux = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + (fd.iauxBase + sym.index)*4)
-                    type_aux = read_auxiliary_symbol(file_data, symbolic_header.cbAuxOffset - OFFSET + (fd.iauxBase + sym.index+1)*4)
-                    print('            %r' % ((aux,)))
-                    print('            %r' % ((type_aux,)))
-            '''
-
-            print('    pretty print:')
-            print_symbols(file_data, fd, symbolic_header)
+            print_symbols(file_data, fd, symbolic_header, read_string(file_data, symbolic_header.cbSsOffset - OFFSET + fd.issBase + fd.rss))
 
 
 main()
